@@ -1,6 +1,9 @@
 const express=require('express'),{createClient}=require('@libsql/client'),bcrypt=require('bcryptjs'),jwt=require('jsonwebtoken');
 const {compute}=require('./calc');
+for(const k of['ADMIN_EMAIL','ADMIN_PASSWORD','RESET_ADMIN_PASSWORD','JWT_SECRET','TURSO_DATABASE_URL','TURSO_AUTH_TOKEN','ACCESS_KEY','OPEN_ACCESS'])if(process.env[k])process.env[k]=process.env[k].trim().replace(/^["']|["']$/g,'');
 const SECRET=process.env.JWT_SECRET;
+const OPEN=process.env.OPEN_ACCESS==='true',ACCESS_KEY=(process.env.ACCESS_KEY||'').length>=16?process.env.ACCESS_KEY:'';
+const SADMIN="SELECT id,name,email,role,active FROM users WHERE role='super_admin' AND active=1 ORDER BY id LIMIT 1";
 if(!SECRET||SECRET.length<24){console.error('Set JWT_SECRET (24+ characters).');process.exit(1)}
 // Free hosting: set TURSO_DATABASE_URL + TURSO_AUTH_TOKEN. Without them it uses a local file (for testing).
 const db=createClient({url:process.env.TURSO_DATABASE_URL||'file:'+(process.env.DB_PATH||'data.db'),authToken:process.env.TURSO_AUTH_TOKEN});
@@ -27,18 +30,25 @@ const allSettings=async()=>Object.fromEntries((await q('SELECT key,value FROM se
 async function init(){
  await db.executeMultiple(SCHEMA+';CREATE UNIQUE INDEX IF NOT EXISTS ux_ref ON documents(quotation_ref) WHERE quotation_ref IS NOT NULL;');
  for(const[k,v]of Object.entries(DEFAULTS))await run('INSERT OR IGNORE INTO settings VALUES(?,?)',[k,JSON.stringify(v)]);
+ // Forgot the password? Set RESET_ADMIN_PASSWORD on the host, redeploy, log in, then DELETE that variable.
+ if(process.env.RESET_ADMIN_PASSWORD&&process.env.ADMIN_EMAIL){const em=process.env.ADMIN_EMAIL.toLowerCase(),h=bcrypt.hashSync(process.env.RESET_ADMIN_PASSWORD,10);
+  if(await one('SELECT 1 x FROM users WHERE email=?',[em]))await run("UPDATE users SET hash=?,active=1,role='super_admin' WHERE email=?",[h,em]);else await run('INSERT INTO users(name,email,hash,role) VALUES(?,?,?,?)',['Super Admin',em,h,'super_admin']);
+  console.log('ADMIN PASSWORD WAS RESET for',em,'- now delete RESET_ADMIN_PASSWORD from the environment.')}
+ if(!(await one('SELECT 1 x FROM users'))&&(OPEN||ACCESS_KEY)&&!process.env.ADMIN_PASSWORD)await run('INSERT INTO users(name,email,hash,role) VALUES(?,?,?,?)',['Admin','admin@local',bcrypt.hashSync(require('crypto').randomBytes(24).toString('hex'),10),'super_admin']);
  if(!(await one('SELECT 1 x FROM users'))&&process.env.ADMIN_EMAIL&&process.env.ADMIN_PASSWORD){
-  await run('INSERT INTO users(name,email,hash,role) VALUES(?,?,?,?)',['Super Admin',process.env.ADMIN_EMAIL.toLowerCase(),bcrypt.hashSync(process.env.ADMIN_PASSWORD,12),'super_admin']);console.log('Super admin created:',process.env.ADMIN_EMAIL)}}
+  await run('INSERT INTO users(name,email,hash,role) VALUES(?,?,?,?)',['Super Admin',process.env.ADMIN_EMAIL.toLowerCase(),bcrypt.hashSync(process.env.ADMIN_PASSWORD,10),'super_admin']);console.log('Super admin created:',process.env.ADMIN_EMAIL)}}
 const fy=d=>{const t=new Date(d),y=t.getUTCMonth()>=3?t.getUTCFullYear():t.getUTCFullYear()-1;return`${String(y).slice(2)}-${String(y+1).slice(2)}`};
 // One atomic statement, so two people saving at once can never get the same number.
 const takeNumber=async(key,start)=>(await one('INSERT INTO counters(key,next) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET next=next+1 RETURNING next',[key,start+1])).next-1;
 const docNumber=async(co,kind,date)=>{const p=co+kind,f=fy(date);return`${p}${await takeNumber(p+'|'+f,f===FIRST_FY?SEED[p]:1)}/${f}`};
-const app=express();app.disable('x-powered-by');app.set('trust proxy',1);app.use(express.json({limit:'200kb'}));app.get('/healthz',(req,res)=>res.send('ok'));app.use(express.static('public',{setHeaders:(r,p)=>{if(p.endsWith('.html'))r.setHeader('Cache-Control','no-cache')}}));
+const app=express();app.disable('x-powered-by');app.set('trust proxy',1);app.use(express.json({limit:'200kb'}));app.get('/healthz',(req,res)=>res.send('ok'));
+app.use(express.static('public',{index:false,setHeaders:(r,p)=>{if(p.endsWith('.html'))r.setHeader('Cache-Control','no-cache')}}));
 const err=(res,c,m)=>res.status(c).json({error:m});
 const A=f=>(req,res,next)=>Promise.resolve(f(req,res,next)).catch(e=>typeof e==='string'?err(res,400,e):(console.error(e),err(res,500,'Something went wrong')));
+app.get('/',A(async(req,res,next)=>{if(ACCESS_KEY&&req.query.key===ACCESS_KEY){const u=await one(SADMIN);if(u){res.setHeader('Set-Cookie',`tok=${jwt.sign({id:u.id},SECRET,{expiresIn:'365d'})}; HttpOnly; SameSite=Lax; Path=/; Max-Age=31536000${process.env.NODE_ENV==='production'?'; Secure':''}`);return res.redirect('/')}}res.setHeader('Cache-Control','no-cache');res.sendFile(require('path').join(__dirname,'public','index.html'))}));
 const tries=new Map();
 const cookie=(req,n)=>((req.headers.cookie||'').split(';').map(s=>s.trim().split('=')).find(a=>a[0]===n)||[])[1];
-const auth=A(async(req,res,next)=>{let u;try{const{id}=jwt.verify(cookie(req,'tok'),SECRET);u=await one('SELECT id,name,email,role,active FROM users WHERE id=?',[id])}catch{}
+const auth=A(async(req,res,next)=>{let u;if(OPEN)u=await one(SADMIN);else try{const{id}=jwt.verify(cookie(req,'tok'),SECRET);u=await one('SELECT id,name,email,role,active FROM users WHERE id=?',[id])}catch{}
  if(!u||!u.active)return err(res,401,'Please log in');req.user=u;next()});
 const admin=(req,res,next)=>req.user.role==='super_admin'?next():err(res,403,'Super admin only');
 app.post('/api/login',A(async(req,res)=>{const ip=req.ip,t=tries.get(ip)||{n:0,at:Date.now()};if(Date.now()-t.at>9e5){t.n=0;t.at=Date.now()}
@@ -49,18 +59,18 @@ app.post('/api/login',A(async(req,res)=>{const ip=req.ip,t=tries.get(ip)||{n:0,a
  res.json({name:u.name,role:u.role})}));
 app.post('/api/logout',(req,res)=>{res.setHeader('Set-Cookie','tok=; HttpOnly; Path=/; Max-Age=0');res.json({ok:1})});
 app.use('/api',auth);
-app.get('/api/me',(req,res)=>res.json(req.user));
+app.get('/api/me',(req,res)=>res.json({...req.user,open:OPEN}));
 app.post('/api/password',A(async(req,res)=>{const u=await one('SELECT hash FROM users WHERE id=?',[req.user.id]),n=String(req.body.new||'');
  if(!bcrypt.compareSync(String(req.body.current||''),u.hash))return err(res,400,'Current password is wrong');if(n.length<8)return err(res,400,'New password needs 8+ characters');
- await run('UPDATE users SET hash=? WHERE id=?',[bcrypt.hashSync(n,12),req.user.id]);res.json({ok:1})}));
+ await run('UPDATE users SET hash=? WHERE id=?',[bcrypt.hashSync(n,10),req.user.id]);res.json({ok:1})}));
 app.get('/api/users',admin,A(async(req,res)=>res.json(await q('SELECT id,name,email,role,active FROM users ORDER BY id'))));
 app.post('/api/users',admin,A(async(req,res)=>{const{name,email,password,role='staff'}=req.body;
  if(!name||!/^\S+@\S+\.\S+$/.test(email||''))return err(res,400,'Name and valid email required');if(String(password||'').length<8)return err(res,400,'Password needs 8+ characters');if(!['staff','super_admin'].includes(role))return err(res,400,'Bad role');
- try{const r=await run('INSERT INTO users(name,email,hash,role) VALUES(?,?,?,?)',[name,email.toLowerCase(),bcrypt.hashSync(password,12),role]);res.status(201).json({id:r.id})}catch{err(res,409,'Email already exists')}}));
+ try{const r=await run('INSERT INTO users(name,email,hash,role) VALUES(?,?,?,?)',[name,email.toLowerCase(),bcrypt.hashSync(password,10),role]);res.status(201).json({id:r.id})}catch{err(res,409,'Email already exists')}}));
 app.patch('/api/users/:id',admin,A(async(req,res)=>{const id=+req.params.id,{active,password}=req.body;
  if(id===req.user.id&&active===false)return err(res,400,'You cannot disable yourself');
  if(active!==undefined)await run('UPDATE users SET active=? WHERE id=?',[active?1:0,id]);
- if(password){if(String(password).length<8)return err(res,400,'Password needs 8+ characters');await run('UPDATE users SET hash=? WHERE id=?',[bcrypt.hashSync(password,12),id])}res.json({ok:1})}));
+ if(password){if(String(password).length<8)return err(res,400,'Password needs 8+ characters');await run('UPDATE users SET hash=? WHERE id=?',[bcrypt.hashSync(password,10),id])}res.json({ok:1})}));
 app.get('/api/settings',A(async(req,res)=>res.json(await allSettings())));
 app.put('/api/settings/:key',admin,A(async(req,res)=>{if(!(req.params.key in DEFAULTS))return err(res,404,'Unknown setting');
  if(req.params.key==='gst_rate'&&!(req.body.value>=0&&req.body.value<=100))return err(res,400,'Rate must be 0-100');
